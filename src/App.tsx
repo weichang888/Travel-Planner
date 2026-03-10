@@ -1,5 +1,5 @@
-﻿import { useEffect, useMemo, useState } from 'react'
-import type { DragEvent, FormEvent } from 'react'
+﻿import { useEffect, useMemo, useRef, useState } from 'react'
+import type { ChangeEvent, DragEvent, FormEvent } from 'react'
 
 type PageView = 'itinerary' | 'journal' | 'journalEdit' | 'shopping' | 'shoppingEdit'
 type ActivityCategory = 'food' | 'spot' | 'transport'
@@ -84,12 +84,23 @@ type PersistedAppState = {
   selectedTripId: string | null
   activeDayByTrip: Record<string, string>
   chartType: ChartType
+  updatedAt: string
+}
+
+type BackupFilePayload = {
+  version: number
+  exportedAt: string
+  appState: PersistedAppState
 }
 
 const inputClass =
   'w-full rounded-md border border-gray-300 bg-white px-3 py-2 text-sm text-notion-text outline-none transition focus:border-gray-400'
 
 const STORAGE_KEY = 'travel-planner-journal-v1'
+const INDEXED_DB_NAME = 'travel-planner-journal-db'
+const INDEXED_DB_VERSION = 1
+const INDEXED_DB_STORE = 'app-state'
+const INDEXED_DB_STATE_KEY = 'main'
 
 const categoryText: Record<ActivityCategory, string> = {
   food: '美食',
@@ -349,7 +360,38 @@ const getDefaultPersistedState = (): PersistedAppState => ({
   selectedTripId: null,
   activeDayByTrip: {},
   chartType: 'pie',
+  updatedAt: '',
 })
+
+const normalizePersistedState = (value: unknown): PersistedAppState => {
+  if (!value || typeof value !== 'object') {
+    return getDefaultPersistedState()
+  }
+
+  const parsed = value as Partial<PersistedAppState>
+  return {
+    userName: typeof parsed.userName === 'string' ? parsed.userName : '',
+    currentView:
+      parsed.currentView === 'itinerary' ||
+      parsed.currentView === 'journal' ||
+      parsed.currentView === 'journalEdit' ||
+      parsed.currentView === 'shopping' ||
+      parsed.currentView === 'shoppingEdit'
+        ? parsed.currentView
+        : 'itinerary',
+    trips: hydrateTrips((parsed as { trips?: unknown }).trips),
+    selectedTripId: typeof parsed.selectedTripId === 'string' ? parsed.selectedTripId : null,
+    activeDayByTrip:
+      parsed.activeDayByTrip && typeof parsed.activeDayByTrip === 'object'
+        ? parsed.activeDayByTrip
+        : {},
+    chartType:
+      parsed.chartType === 'pie' || parsed.chartType === 'donut' || parsed.chartType === 'bar'
+        ? parsed.chartType
+        : 'pie',
+    updatedAt: typeof parsed.updatedAt === 'string' ? parsed.updatedAt : '',
+  }
+}
 
 const loadPersistedState = (): PersistedAppState => {
   try {
@@ -357,31 +399,53 @@ const loadPersistedState = (): PersistedAppState => {
     if (!raw) {
       return getDefaultPersistedState()
     }
-    const parsed = JSON.parse(raw) as Partial<PersistedAppState>
-    return {
-      userName: typeof parsed.userName === 'string' ? parsed.userName : '',
-      currentView:
-        parsed.currentView === 'itinerary' ||
-        parsed.currentView === 'journal' ||
-        parsed.currentView === 'journalEdit' ||
-        parsed.currentView === 'shopping' ||
-        parsed.currentView === 'shoppingEdit'
-          ? parsed.currentView
-          : 'itinerary',
-      trips: hydrateTrips(parsed.trips),
-      selectedTripId: typeof parsed.selectedTripId === 'string' ? parsed.selectedTripId : null,
-      activeDayByTrip:
-        parsed.activeDayByTrip && typeof parsed.activeDayByTrip === 'object'
-          ? parsed.activeDayByTrip
-          : {},
-      chartType:
-        parsed.chartType === 'pie' || parsed.chartType === 'donut' || parsed.chartType === 'bar'
-          ? parsed.chartType
-          : 'pie',
-    }
+    return normalizePersistedState(JSON.parse(raw))
   } catch {
     return getDefaultPersistedState()
   }
+}
+
+const openPersistedDb = () =>
+  new Promise<IDBDatabase>((resolve, reject) => {
+    const request = window.indexedDB.open(INDEXED_DB_NAME, INDEXED_DB_VERSION)
+
+    request.onupgradeneeded = () => {
+      const db = request.result
+      if (!db.objectStoreNames.contains(INDEXED_DB_STORE)) {
+        db.createObjectStore(INDEXED_DB_STORE)
+      }
+    }
+
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error ?? new Error('無法開啟 IndexedDB'))
+  })
+
+const saveStateToIndexedDb = async (state: PersistedAppState) => {
+  const db = await openPersistedDb()
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(INDEXED_DB_STORE, 'readwrite')
+    tx.objectStore(INDEXED_DB_STORE).put(state, INDEXED_DB_STATE_KEY)
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => reject(tx.error ?? new Error('寫入 IndexedDB 失敗'))
+    tx.onabort = () => reject(tx.error ?? new Error('寫入 IndexedDB 中止'))
+  })
+  db.close()
+}
+
+const loadStateFromIndexedDb = async (): Promise<PersistedAppState | null> => {
+  const db = await openPersistedDb()
+  const result = await new Promise<unknown>((resolve, reject) => {
+    const tx = db.transaction(INDEXED_DB_STORE, 'readonly')
+    const request = tx.objectStore(INDEXED_DB_STORE).get(INDEXED_DB_STATE_KEY)
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error ?? new Error('讀取 IndexedDB 失敗'))
+  })
+  db.close()
+
+  if (!result) {
+    return null
+  }
+  return normalizePersistedState(result)
 }
 
 const formatCurrency = (value: number) =>
@@ -755,6 +819,31 @@ function App() {
     note: '',
     imageUrl: '',
   })
+  const backupFileInputRef = useRef<HTMLInputElement | null>(null)
+  const latestPersistedAtRef = useRef(initialState.updatedAt)
+
+  const buildPersistedState = (updatedAt = new Date().toISOString()): PersistedAppState => ({
+    userName,
+    currentView,
+    trips,
+    selectedTripId,
+    activeDayByTrip,
+    chartType,
+    updatedAt,
+  })
+
+  const applyPersistedState = (value: unknown) => {
+    const normalized = normalizePersistedState(value)
+    setUserName(normalized.userName)
+    setCurrentView(normalized.currentView)
+    setTrips(normalized.trips)
+    setSelectedTripId(normalized.selectedTripId)
+    setActiveDayByTrip(normalized.activeDayByTrip)
+    setChartType(normalized.chartType)
+    setEditingJournalId(null)
+    setJournalForm(createEmptyJournalForm())
+    latestPersistedAtRef.current = normalized.updatedAt
+  }
 
   const selectedTrip = useMemo(
     () => trips.find((trip) => trip.id === selectedTripId) ?? null,
@@ -784,15 +873,42 @@ function App() {
   }, [selectedTripId])
 
   useEffect(() => {
-    const payload: PersistedAppState = {
-      userName,
-      currentView,
-      trips,
-      selectedTripId,
-      activeDayByTrip,
-      chartType,
+    let canceled = false
+
+    void (async () => {
+      try {
+        const indexedState = await loadStateFromIndexedDb()
+        if (!indexedState || canceled) {
+          return
+        }
+
+        const localTimestamp = Date.parse(latestPersistedAtRef.current || '')
+        const indexedTimestamp = Date.parse(indexedState.updatedAt || '')
+
+        if (
+          Number.isFinite(indexedTimestamp) &&
+          (!Number.isFinite(localTimestamp) || indexedTimestamp > localTimestamp)
+        ) {
+          applyPersistedState(indexedState)
+        }
+      } catch {
+        // IndexedDB 不可用時保持 localStorage 版本
+      }
+    })()
+
+    return () => {
+      canceled = true
     }
+  }, [])
+
+  useEffect(() => {
+    const payload = buildPersistedState()
+    latestPersistedAtRef.current = payload.updatedAt
     localStorage.setItem(STORAGE_KEY, JSON.stringify(payload))
+
+    void saveStateToIndexedDb(payload).catch(() => {
+      // IndexedDB 失敗不影響主流程，仍保留 localStorage
+    })
   }, [userName, currentView, trips, selectedTripId, activeDayByTrip, chartType])
 
   const activeDayId =
@@ -836,6 +952,52 @@ function App() {
 
   const updateTrip = (tripId: string, updater: (trip: TripRecord) => TripRecord) => {
     setTrips((prev) => prev.map((trip) => (trip.id === tripId ? updater(trip) : trip)))
+  }
+
+  const handleExportBackup = () => {
+    const snapshot = buildPersistedState()
+    const payload: BackupFilePayload = {
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      appState: snapshot,
+    }
+
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const stamp = payload.exportedAt.slice(0, 19).replace(/[:T]/g, '-')
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `travel-backup-${stamp}.json`
+    anchor.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const handleImportBackup = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    if (!file) {
+      return
+    }
+
+    try {
+      const content = await file.text()
+      const parsed = JSON.parse(content) as unknown
+      const appState =
+        parsed && typeof parsed === 'object' && 'appState' in parsed
+          ? (parsed as { appState: unknown }).appState
+          : parsed
+
+      const confirmed = window.confirm('確定要用這份備份覆蓋目前資料嗎？')
+      if (!confirmed) {
+        return
+      }
+
+      applyPersistedState(appState)
+      window.alert('備份已還原。')
+    } catch {
+      window.alert('備份檔格式錯誤，匯入失敗。')
+    } finally {
+      event.target.value = ''
+    }
   }
 
   const handleCreateTrip = (event: FormEvent<HTMLFormElement>) => {
@@ -1374,6 +1536,15 @@ function App() {
 
   return (
     <div className="min-h-screen bg-notion-bg font-sans text-notion-text" onClick={() => setOpenMenuId(null)}>
+      <input
+        ref={backupFileInputRef}
+        type="file"
+        accept=".json,application/json"
+        className="hidden"
+        onChange={(event) => {
+          void handleImportBackup(event)
+        }}
+      />
       <div className="flex min-h-screen">
         <aside className="hidden w-64 shrink-0 border-r border-gray-200 bg-notion-sidebar p-4 md:flex md:flex-col">
           <p className="mb-3 px-2 text-xs uppercase tracking-wide text-gray-500">旅程</p>
@@ -1391,6 +1562,27 @@ function App() {
               className={inputClass}
             />
             <p className="mt-2 text-xs text-gray-500">您好，{userName.trim() || '旅人'}。</p>
+          </div>
+
+          <div className="mb-4 rounded-lg border border-gray-200 bg-white p-3">
+            <p className="text-xs text-gray-500">資料保護</p>
+            <div className="mt-2 grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={handleExportBackup}
+                className="rounded-md border border-gray-200 px-2 py-2 text-xs transition hover:bg-gray-100"
+              >
+                匯出備份
+              </button>
+              <button
+                type="button"
+                onClick={() => backupFileInputRef.current?.click()}
+                className="rounded-md border border-gray-200 px-2 py-2 text-xs transition hover:bg-gray-100"
+              >
+                匯入備份
+              </button>
+            </div>
+            <p className="mt-2 text-xs text-gray-400">已啟用本機雙重保存（localStorage + IndexedDB）。</p>
           </div>
 
           <form onSubmit={handleCreateTrip} className="mb-4 space-y-2 rounded-lg border border-gray-200 bg-white p-3">
@@ -1449,6 +1641,26 @@ function App() {
                     placeholder="請輸入你的名字"
                     className={inputClass}
                   />
+                </div>
+
+                <div className="mb-2 rounded-md border border-gray-200 bg-white p-3">
+                  <p className="text-xs text-gray-500">資料保護</p>
+                  <div className="mt-2 grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={handleExportBackup}
+                      className="rounded-md border border-gray-200 px-2 py-2 text-xs transition hover:bg-gray-100"
+                    >
+                      匯出備份
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => backupFileInputRef.current?.click()}
+                      className="rounded-md border border-gray-200 px-2 py-2 text-xs transition hover:bg-gray-100"
+                    >
+                      匯入備份
+                    </button>
+                  </div>
                 </div>
 
                 <form onSubmit={handleCreateTrip} className="space-y-2 rounded-md border border-gray-200 bg-white p-3">
@@ -2312,3 +2524,4 @@ function App() {
 }
 
 export default App
+
